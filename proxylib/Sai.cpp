@@ -3,6 +3,7 @@
 #include "SaiInternal.h"
 #include "ZeroMQChannel.h"
 #include "SaiAttributeList.h"
+#include "NotificationFactory.h"
 
 #include "meta/Meta.h"
 #include "meta/sai_serialize.h"
@@ -71,11 +72,15 @@ sai_status_t Sai::apiInitialize(
 
     memcpy(&m_service_method_table, service_method_table, sizeof(m_service_method_table));
 
-    // TODO move hard coded values to config
+    memset(&m_sn, 0, sizeof(m_sn));
+
+    m_options = std::make_shared<Options>(); // load default options
+
+    // TODO options should be obtained from service method table
 
     m_communicationChannel = std::make_shared<sairedis::ZeroMQChannel>(
-            "tcp://127.0.0.1:5555",
-            "tcp://127.0.0.1:5556",
+            m_options->m_zmqChannel,
+            m_options->m_zmqNtfChannel,
             std::bind(&Sai::handleNotification, this, _1, _2, _3));
 
     m_apiInitialized = true;
@@ -89,6 +94,8 @@ sai_status_t Sai::apiUninitialize(void)
     PROXY_CHECK_API_INITIALIZED();
 
     SWSS_LOG_NOTICE("begin");
+
+    m_communicationChannel = nullptr; // will stop the thread
 
     m_apiInitialized = false;
 
@@ -126,10 +133,13 @@ sai_status_t Sai::create(
 
     auto status = m_communicationChannel->wait("create_response", kco);
 
-    // TODO SAVE pointers for notifications
-
     if (status == SAI_STATUS_SUCCESS)
     {
+        if (objectType == SAI_OBJECT_TYPE_SWITCH)
+        {
+            updateNotifications(attr_count, attr_list); // TODO should be per switch
+        }
+
         auto& values = kfvFieldsValues(kco);
 
         if (values.size() == 0)
@@ -267,8 +277,6 @@ sai_status_t Sai::create(
 
     std::string key = serializedObjectType + ":" + entry;
 
-    // TODO SAVE pointers for notifications
-
     m_communicationChannel->set(key, vals, "create_entry");
 
     swss::KeyOpFieldsValuesTuple kco;
@@ -302,8 +310,6 @@ sai_status_t Sai::set(
 
     auto val = saimeta::SaiAttributeList::serialize_attr_list(objectType, 1, attr, false);
 
-    // TODO SAVE pointers for notifications
-
     auto serializedObjectType = sai_serialize_object_type(objectType);
 
     std::string key = serializedObjectType + ":" + entry;
@@ -312,7 +318,14 @@ sai_status_t Sai::set(
 
     swss::KeyOpFieldsValuesTuple kco;
 
-    return m_communicationChannel->wait("set_response", kco);
+    auto status = m_communicationChannel->wait("set_response", kco);
+
+    if (objectType == SAI_OBJECT_TYPE_SWITCH && status == SAI_STATUS_SUCCESS)
+    {
+        updateNotifications(1, attr);
+    }
+
+    return status;
 }
 
 sai_status_t Sai::get(
@@ -1102,47 +1115,47 @@ sai_status_t Sai::queryApiVersion(
     return status;
 }
 
+// TODO use function from SAI metadata to populate those
+
+void Sai::updateNotifications(
+        _In_ uint32_t attrCount,
+        _In_ const sai_attribute_t *attrList)
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * This function should only be called on CREATE/SET
+     * api when object is SWITCH.
+     */
+
+    sai_metadata_update_switch_notification_pointers(&m_sn, attrCount, attrList);
+}
+
 void Sai::handleNotification(
         _In_ const std::string &name,
         _In_ const std::string &serializedNotification,
         _In_ const std::vector<swss::FieldValueTuple> &values)
 {
+    MUTEX();
     SWSS_LOG_ENTER();
 
-    SWSS_LOG_ERROR("FIXME");
-}
+    if (!m_apiInitialized)
+    {
+        SWSS_LOG_ERROR("%s: api not initialized", __PRETTY_FUNCTION__);
 
-//sai_switch_notifications_t Sai::handle_notification(
-//        _In_ std::shared_ptr<Notification> notification)
-//{
-//    MUTEX();
-//    SWSS_LOG_ENTER();
-//
-//    if (!m_apiInitialized)
-//    {
-//        SWSS_LOG_ERROR("%s: api not initialized", __PRETTY_FUNCTION__);
-//
-//        return { };
-//    }
-//
-//    return context->m_redisSai->syncProcessNotification(notification);
-//}
-//
-//void Sai::handleNotification(
-//        _In_ const std::string &name,
-//        _In_ const std::string &serializedNotification,
-//        _In_ const std::vector<swss::FieldValueTuple> &values)
-//{
-//    SWSS_LOG_ENTER();
-//
-//    auto notification = NotificationFactory::deserialize(name, serializedNotification);
-//
-//    if (notification)
-//    {
-//        auto _sn = m_notificationCallback(notification); // will be synchronized to api mutex
-//
-//        // execute callback from notification thread
-//
-//        notification->executeCallback(_sn);
-//    }
-//}
+        return;
+    }
+
+    // TODO should be per switch, and we should know on which switch call notification
+
+    auto notification = sairedis::NotificationFactory::deserialize(name, serializedNotification);
+
+    if (notification)
+    {
+        SWSS_LOG_INFO("got notification: %s, executing callback!", serializedNotification.c_str());
+
+        // execute callback from notification thread
+
+        notification->executeCallback(m_sn);
+    }
+}
